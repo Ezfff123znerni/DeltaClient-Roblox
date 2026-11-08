@@ -339,7 +339,10 @@ local DeltaLanguage=(function()
     {"The panel lists only active features: switching a toggle off or releasing a hold removes its row. Click a bind badge to reassign it. Drag the header to move the panel. M1 is left-click, M2 is right-click, AUTO is automatic, and '-' means unbound.","Панель показывает только активные функции: Toggle выключен — строка исчезла; Hold отпущен — строка исчезла. Нажми кнопку бинда справа для переназначения. Панель можно перетащить за заголовок. M1 — ЛКМ, M2 — ПКМ, AUTO — автоматический режим, '-' — бинд не назначен."},
     {"Settings and keybinds","Настройки и бинды"},
     {"Create a config after choosing your settings. Save Selected updates it; Load Selected restores it. To rename a config, enter the new Config Name and choose Rename Selected. Set as Auto Load restores that config on the next launch. File storage support is required.","Создай конфиг после настройки функций. Save Selected обновляет выбранный; Load Selected загружает его. Для переименования введи новое имя в Config Name и нажми Rename Selected. Set as Auto Load восстанавливает выбранный конфиг при следующем запуске. Нужна поддержка файлового API среды запуска."},
-    {"Interface","Интерфейс"}
+    {"Interface","Интерфейс"},
+    {"AutoConfig","AutoConfig"},
+    {"AutoConfig enabled","AutoConfig включён"},
+    {"AutoConfig disabled","AutoConfig выключен"}
 }
     local toEnglish,toRussian={},{}
     for _,pair in ipairs(pairsList) do
@@ -3163,6 +3166,7 @@ table.insert(HUDConnections,Native.Connect(UserInputService.InputBegan,function(
 end))
 
 local function HUDMake(class,properties,parent)
+    DeltaBoot.Checkpoint()
     local instance=Instance.new(class)
     for key,value in pairs(properties or {}) do instance[key]=value end
     DeltaLanguage.Track(instance)
@@ -3182,7 +3186,7 @@ local function HUDResetPosition()
 end
 
 local function HUDRefresh()
-    if not HUDFrame then return end
+    if not HUDFrame or HUDConfig.Building then return end
     local count=0
     for _,feature in ipairs(HUDFeatures) do
         local row=HUDRows[feature.id]
@@ -3218,6 +3222,7 @@ local function HUDRefresh()
 end
 
 local function HUDBuild()
+    HUDConfig.Building=true
     local playerGui=LocalPlayer:WaitForChild("PlayerGui",10)
     assert(playerGui,"PlayerGui unavailable")
     local old=playerGui:FindFirstChild("CombatKeybindsHUD")
@@ -3280,6 +3285,7 @@ local function HUDBuild()
     if HUDConfig.Position then
         local p=HUDConfig.Position;HUDFrame.Position=UDim2.new(p.xs,p.xo,p.ys,p.yo)
     end
+    HUDConfig.Building=false
     HUDRefresh()
 end
 
@@ -3964,6 +3970,7 @@ local ConfigRoot="DEV_HUB"
 local ConfigFolder=ConfigRoot.."/configs"
 local ConfigMeta=ConfigRoot.."/autoload.json"
 local ConfigSelected,ConfigName,ConfigAutoName=nil,"",nil
+local AutoConfig={Enabled=true,Syncing=false}
 local ConfigDropdown,ConfigNameInput,ConfigStatusLabel,ConfigAutoLabel
 local function ConfigStatus(text)
     if ConfigStatusLabel then ConfigStatusLabel:Set(text) end
@@ -4135,16 +4142,29 @@ local function ConfigApply(payload)
     assert(ok,"Config load failed: "..tostring(err))
 end
 local function ConfigReadAuto()
-    if not isfile(ConfigMeta) then return nil end
+    if not isfile(ConfigMeta) then AutoConfig.Enabled=true;return nil end
     local meta=ConfigReadJSON(ConfigMeta)
+    assert(meta.enabled==nil or type(meta.enabled)=="boolean","Invalid AutoConfig setting")
+    -- Older files stored only the selected name; keep their existing selection.
+    AutoConfig.Enabled=meta.enabled~=false
     if meta.name==false or meta.name==nil then return nil end
     return ConfigValidName(meta.name)
 end
-local function ConfigSetAuto(name)
-    ConfigWriteJSON(ConfigMeta,{version=1,name=name or false})
-    ConfigAutoName=name
-    if ConfigAutoLabel then ConfigAutoLabel:Set("Auto load: "..(name or "disabled")) end
+local function ConfigSyncAuto()
+    if ConfigAutoLabel then ConfigAutoLabel:Set("Auto load: "..(ConfigAutoName or "(none)")) end
+    if AutoConfig.Toggle then
+        AutoConfig.Syncing=true
+        AutoConfig.Toggle:Set(AutoConfig.Enabled)
+        AutoConfig.Syncing=false
+    end
 end
+local function ConfigSetAuto(name,enabled)
+    if enabled==nil then enabled=AutoConfig.Enabled end
+    ConfigWriteJSON(ConfigMeta,{version=1,name=name or false,enabled=enabled})
+    ConfigAutoName=name;AutoConfig.Enabled=enabled
+    ConfigSyncAuto()
+end
+pcall(function() ConfigAutoName=ConfigReadAuto() end)
 local function ConfigRefresh()
     ConfigStorage()
     local names={}
@@ -4163,7 +4183,7 @@ local function ConfigRefresh()
     ConfigDropdown:Refresh(#names>0 and names or {"(none)"})
     ConfigDropdown:Set({target or "(none)"})
     ConfigAutoName=ConfigReadAuto()
-    ConfigAutoLabel:Set("Auto load: "..(ConfigAutoName or "disabled"))
+    ConfigSyncAuto()
     return names
 end
 local function ConfigNeedSelected()
@@ -4194,7 +4214,9 @@ ConfigTab:CreateButton({Name="Create Config",Callback=function() ConfigAction(fu
     local name=ConfigValidName(ConfigName)
     assert(not isfile(ConfigPath(name)),"Config already exists; use Save Selected")
     ConfigWriteJSON(ConfigPath(name),ConfigSnapshot())
-    ConfigSelected=name;ConfigRefresh();ConfigNotify("Created: "..name)
+    ConfigSelected=name
+    if not ConfigAutoName then ConfigSetAuto(name) end
+    ConfigRefresh();ConfigNotify("Created: "..name)
 end) end})
 ConfigTab:CreateButton({Name="Save Selected",Callback=function() ConfigAction(function()
     local name=ConfigNeedSelected();ConfigWriteJSON(ConfigPath(name),ConfigSnapshot());ConfigNotify("Saved: "..name)
@@ -4218,27 +4240,40 @@ ConfigTab:CreateButton({Name="Delete Selected",Callback=function() ConfigAction(
 end) end})
 ConfigTab:CreateButton({Name="Refresh List",Callback=function() ConfigAction(function() ConfigRefresh();ConfigStatus("Config list refreshed") end) end})
 ConfigTab:CreateSection("Auto Load")
-ConfigAutoLabel=ConfigTab:CreateLabel("Auto load: disabled")
+AutoConfig.Toggle=ConfigTab:CreateToggle({Name="AutoConfig",CurrentValue=AutoConfig.Enabled,Callback=function(value)
+    if AutoConfig.Syncing then return end
+    ConfigAction(function()
+        ConfigSetAuto(ConfigAutoName or ConfigSelected,value)
+        ConfigNotify(value and "AutoConfig enabled" or "AutoConfig disabled")
+    end)
+    ConfigSyncAuto()
+end})
+ConfigAutoLabel=ConfigTab:CreateLabel("Auto load: "..(ConfigAutoName or "(none)"))
 ConfigTab:CreateButton({Name="Set as Auto Load",Callback=function() ConfigAction(function()
-    local name=ConfigNeedSelected();ConfigSetAuto(name);ConfigNotify("Auto load: "..name)
+    local name=ConfigNeedSelected();ConfigSetAuto(name,true);ConfigNotify("Auto load: "..name)
 end) end})
 ConfigTab:CreateButton({Name="Disable Auto Load",Callback=function() ConfigAction(function()
-    ConfigSetAuto(nil);ConfigNotify("Auto load disabled")
+    ConfigSetAuto(ConfigAutoName,false);ConfigNotify("Auto load disabled")
 end) end})
 ConfigStatusLabel=ConfigTab:CreateLabel("Config storage: waiting")
 
-Native.Delay(1,function()
+local function ConfigBootstrap()
     local ok,err=pcall(function()
         ConfigRefresh()
         ConfigStatus("Delta Client configs ready")
-        local name=ConfigReadAuto()
-        if name then
-            assert(isfile(ConfigPath(name)),"Auto-load config is missing: "..name)
-            ConfigSelected=name;ConfigDropdown:Set({name});ConfigLoad(name)
+        local name=ConfigAutoName
+        if AutoConfig.Enabled then
+            if not name and ConfigSelected then
+                name=ConfigSelected;ConfigSetAuto(name)
+            end
+            if name then
+                assert(isfile(ConfigPath(name)),"Auto-load config is missing: "..name)
+                ConfigSelected=name;ConfigDropdown:Set({name});ConfigLoad(name)
+            end
         end
     end)
     if not ok then ConfigLoading=false;ConfigStatus("Config unavailable: "..tostring(err)) end
-end)
+end
 
 
 Native.SetPause(function()
@@ -4278,6 +4313,9 @@ end)
 
 Movement.SetGuard(function() return AimCapturingBind or HUDCapture~=nil end)
 Movement.Init()
+if HUDConfig.Enabled and not HUDFrame then HUDBuild() end
+Native.Start(true)
+Native.Delay(1,ConfigBootstrap)
 Native.Window().Enabled=true
 
 -- DELTA CLIENT RUNTIME RETURN
